@@ -1,0 +1,5 @@
+# Ignore all PNG image files
+*.png
+
+# Ignore PNG files in subdirectories
+**/*.png

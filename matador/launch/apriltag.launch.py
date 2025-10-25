@@ -12,14 +12,22 @@ def generate_launch_description():
     )
     config_file = os.path.join(config_dir, 'apriltag.yaml')
 
+    # Camera info publisher node
+    camera_info_publisher_node = Node(
+        package='matador',
+        executable='calibration_publisher',
+        name='camera_info_publisher',
+        output='screen'
+    )
+
     # AprilTag node
     apriltag_node = Node(
         package='apriltag_ros',
         executable='apriltag_node',
         name='apriltag',
         remappings=[
-            ('image_rect', '/camera/image_raw'),
-            ('camera_info', '/camera/camera_info'),
+            ('image_rect', '/image_raw'),
+            ('camera_info', '/camera_info'),
         ],
         parameters=[config_file],
         output='screen'

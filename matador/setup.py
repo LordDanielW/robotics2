@@ -28,6 +28,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'calibration_publisher = matador.camera_info_publisher:main',
         ],
     },
 )
