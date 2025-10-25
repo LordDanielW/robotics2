@@ -14,6 +14,7 @@ setup(
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
         (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
+        (os.path.join('share', package_name, 'config'), glob('config/*.rviz')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -29,6 +30,7 @@ setup(
     entry_points={
         'console_scripts': [
             'calibration_publisher = matador.camera_info_publisher:main',
+            'move_to_apriltag = matador.move_to_apriltag:main',
         ],
     },
 )
