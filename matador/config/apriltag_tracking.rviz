@@ -58,10 +58,10 @@ Visualization Manager:
       Update Interval: 0
       Value: true
     - Class: rviz_default_plugins/Camera
-      Enabled: false
+      Enabled: true
       Far Plane Distance: 100
       Image Rendering: background and overlay
-      Name: Camera
+      Name: Camera (image_raw)
       Overlay Alpha: 0.5
       Topic:
         Depth: 5
@@ -69,7 +69,7 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /image_raw
-      Value: false
+      Value: true
       Visibility:
         Grid: true
         TF: true

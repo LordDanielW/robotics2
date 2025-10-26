@@ -2,8 +2,11 @@
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import TwistStamped
 from apriltag_msgs.msg import AprilTagDetectionArray
+from std_msgs.msg import String
+from tf2_ros import TransformListener, Buffer
+from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
 import math
 
 
@@ -22,7 +25,10 @@ class MoveToAprilTag(Node):
         super().__init__('move_to_apriltag')
         
         # Publisher for velocity commands
-        self.vel_publisher = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.vel_publisher = self.create_publisher(TwistStamped, '/cmd_vel', 10)
+        
+        # Publisher for robot state
+        self.state_publisher = self.create_publisher(String, '/robot_state', 10)
         
         # Subscriber for AprilTag detections
         self.tag_subscriber = self.create_subscription(
@@ -32,6 +38,10 @@ class MoveToAprilTag(Node):
             10
         )
         
+        # TF2 listener for getting tag pose
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        
         # Control timer - runs at 10 Hz
         self.control_timer = self.create_timer(0.1, self.control_loop)
         
@@ -40,11 +50,20 @@ class MoveToAprilTag(Node):
         self.CENTERING = 1
         self.FOLLOWING = 2  # Changed from APPROACHING and ARRIVED
         
+        # State names for publishing
+        self.state_names = {
+            self.SEARCHING: 'SEARCHING',
+            self.CENTERING: 'CENTERING',
+            self.FOLLOWING: 'FOLLOWING'
+        }
+        
         self.state = self.SEARCHING
+        self.publish_state()  # Publish initial state
         
         # Detection data
         self.latest_detection = None
         self.tag_detected = False
+        self.detected_tag_frame = None  # Store the TF frame name of detected tag
         
         # Control parameters
         self.target_distance = 0.5  # 50 cm in meters
@@ -72,9 +91,20 @@ class MoveToAprilTag(Node):
             # Use the first detected tag
             self.latest_detection = msg.detections[0]
             self.tag_detected = True
+            # Generate the TF frame name for this tag (format: apriltag_16h5_id_X)
+            tag_id = self.latest_detection.id
+            tag_family = self.latest_detection.family[3:]
+            self.detected_tag_frame = f'apriltag_{tag_family}_id_{tag_id}'
         else:
             self.tag_detected = False
             self.latest_detection = None
+            self.detected_tag_frame = None
+
+    def publish_state(self):
+        """Publish the current state as a string message."""
+        state_msg = String()
+        state_msg.data = self.state_names.get(self.state, 'UNKNOWN')
+        self.state_publisher.publish(state_msg)
 
     def get_tag_position_in_image(self):
         """
@@ -97,24 +127,39 @@ class MoveToAprilTag(Node):
 
     def get_tag_distance(self):
         """
-        Get the distance to the tag from the pose information.
+        Get the distance to the tag from the TF transform.
         Returns distance in meters.
         """
-        if self.latest_detection is None:
+        if not self.tag_detected or self.detected_tag_frame is None:
             return None
         
-        # Get the position from the pose
-        pose = self.latest_detection.pose.pose.pose
-        position = pose.position
-        
-        # Calculate distance (primarily using z-coordinate which is forward)
-        distance = math.sqrt(position.x**2 + position.y**2 + position.z**2)
-        
-        return distance
+        try:
+            # Look up the transform from camera frame to tag frame
+            # The camera frame is typically 'camera' or 'camera_link'
+            transform = self.tf_buffer.lookup_transform(
+                'default_cam',  # Target frame (camera)
+                self.detected_tag_frame,  # Source frame (tag)
+                rclpy.time.Time(),  # Latest available transform
+                timeout=rclpy.duration.Duration(seconds=0.1)
+            )
+            
+            # Get the translation (position) from the transform
+            translation = transform.transform.translation
+            
+            # Calculate distance
+            distance = math.sqrt(translation.x**2 + translation.y**2 + translation.z**2)
+            
+            return distance
+            
+        except (LookupException, ConnectivityException, ExtrapolationException) as e:
+            self.get_logger().warn(f'Could not get transform to {self.detected_tag_frame}: {e}')
+            return None
 
     def control_loop(self):
         """Main control loop - state machine."""
-        cmd = Twist()
+        cmd = TwistStamped()
+        cmd.header.stamp = self.get_clock().now().to_msg()
+        cmd.header.frame_id = 'base_link'
         
         if self.state == self.SEARCHING:
             self.search_for_tag(cmd)
@@ -133,16 +178,18 @@ class MoveToAprilTag(Node):
         if self.tag_detected:
             self.get_logger().info('Tag detected! Transitioning to CENTERING state')
             self.state = self.CENTERING
-            cmd.angular.z = 0.0
+            self.publish_state()
+            cmd.twist.angular.z = 0.0
         else:
             # Continue rotating
-            cmd.angular.z = self.search_angular_velocity
+            cmd.twist.angular.z = self.search_angular_velocity
 
     def center_tag(self, cmd):
         """State: Rotate to center the tag in the camera view."""
         if not self.tag_detected:
             self.get_logger().warn('Tag lost! Returning to SEARCHING state')
             self.state = self.SEARCHING
+            self.publish_state()
             return
         
         x_pos, _ = self.get_tag_position_in_image()
@@ -157,13 +204,14 @@ class MoveToAprilTag(Node):
                 self.get_logger().info(f'Tag centered! Distance: {distance:.2f} m')
                 self.get_logger().info('Transitioning to FOLLOWING state - will continuously track tag')
                 self.state = self.FOLLOWING
-            cmd.angular.z = 0.0
+                self.publish_state()
+            cmd.twist.angular.z = 0.0
         else:
             # Proportional control to center the tag
             # Negative because positive x_pos means tag is to the right,
             # so we need to turn right (negative angular velocity)
             angular_vel = -self.centering_angular_gain * x_pos
-            cmd.angular.z = max(min(angular_vel, self.max_angular_velocity), 
+            cmd.twist.angular.z = max(min(angular_vel, self.max_angular_velocity), 
                                -self.max_angular_velocity)
 
     def follow_tag(self, cmd):
@@ -171,6 +219,7 @@ class MoveToAprilTag(Node):
         if not self.tag_detected:
             self.get_logger().warn('Tag lost! Returning to SEARCHING state')
             self.state = self.SEARCHING
+            self.publish_state()
             return
         
         distance = self.get_tag_distance()
@@ -185,20 +234,20 @@ class MoveToAprilTag(Node):
         # Check if we're within the deadband (no movement zone)
         if abs(distance_error) <= self.deadband_radius:
             # Within deadband - only maintain centering, no forward/backward movement
-            cmd.linear.x = 0.0
+            cmd.twist.linear.x = 0.0
         elif distance_error > 0:
             # Tag is too far - move forward
             linear_vel = self.approach_linear_gain * distance_error
-            cmd.linear.x = min(linear_vel, self.max_linear_velocity)
+            cmd.twist.linear.x = min(linear_vel, self.max_linear_velocity)
         else:
             # Tag is too close - move backward
             linear_vel = self.approach_linear_gain * distance_error
             # Clamp backward velocity (negative)
-            cmd.linear.x = max(linear_vel, -self.max_linear_velocity)
+            cmd.twist.linear.x = max(linear_vel, -self.max_linear_velocity)
         
         # Continuously maintain centering while following
         angular_vel = -self.centering_angular_gain * x_pos * 0.5  # Reduced gain while moving
-        cmd.angular.z = max(min(angular_vel, self.max_angular_velocity), 
+        cmd.twist.angular.z = max(min(angular_vel, self.max_angular_velocity), 
                            -self.max_angular_velocity)
         
         # Log progress periodically
@@ -213,9 +262,11 @@ class MoveToAprilTag(Node):
         
     def stop_robot(self):
         """Send stop command to robot."""
-        cmd = Twist()
-        cmd.linear.x = 0.0
-        cmd.angular.z = 0.0
+        cmd = TwistStamped()
+        cmd.header.stamp = self.get_clock().now().to_msg()
+        cmd.header.frame_id = 'base_link'
+        cmd.twist.linear.x = 0.0
+        cmd.twist.angular.z = 0.0
         self.vel_publisher.publish(cmd)
         self.get_logger().info('Robot stopped')
 
